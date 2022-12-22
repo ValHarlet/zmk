@@ -152,7 +152,17 @@ const char *zmk_keymap_layer_label(uint8_t layer) {
     return zmk_keymap_layer_names[layer];
 }
 
-int zmk_keymap_apply_position_state(int layer, uint32_t position, bool pressed, int64_t timestamp) {
+int invoke_locally(struct zmk_behavior_binding *binding, struct zmk_behavior_binding_event event,
+                   bool pressed) {
+    if (pressed) {
+        return behavior_keymap_binding_pressed(binding, event);
+    } else {
+        return behavior_keymap_binding_released(binding, event);
+    }
+}
+
+int zmk_keymap_apply_position_state(uint8_t source, int layer, uint32_t position, bool pressed,
+                                    int64_t timestamp) {
     // We want to make a copy of this, since it may be converted from
     // relative to absolute before being invoked
     struct zmk_behavior_binding binding = zmk_keymap[layer][position];
@@ -169,7 +179,7 @@ int zmk_keymap_apply_position_state(int layer, uint32_t position, bool pressed, 
     behavior = device_get_binding(binding.behavior_dev);
 
     if (!behavior) {
-        LOG_DBG("No behavior assigned to %d on layer %d", position, layer);
+        LOG_WRN("No behavior assigned to %d on layer %d", position, layer);
         return 1;
     }
 
@@ -184,6 +194,36 @@ int zmk_keymap_apply_position_state(int layer, uint32_t position, bool pressed, 
     } else {
         return behavior_keymap_binding_released(&binding, event);
     }
+    enum behavior_locality locality = BEHAVIOR_LOCALITY_CENTRAL;
+    err = behavior_get_locality(behavior, &locality);
+    if (err) {
+        LOG_ERR("Failed to get behavior locality %d", err);
+        return err;
+    }
+
+    switch (locality) {
+    case BEHAVIOR_LOCALITY_CENTRAL:
+        return invoke_locally(&binding, event, pressed);
+    case BEHAVIOR_LOCALITY_EVENT_SOURCE:
+#if ZMK_BLE_IS_CENTRAL
+        if (source == ZMK_POSITION_STATE_CHANGE_SOURCE_LOCAL) {
+            return invoke_locally(&binding, event, pressed);
+        } else {
+            return zmk_split_bt_invoke_behavior(source, &binding, event, pressed);
+        }
+#else
+        return invoke_locally(&binding, event, pressed);
+#endif
+    case BEHAVIOR_LOCALITY_GLOBAL:
+#if ZMK_BLE_IS_CENTRAL
+        for (int i = 0; i < ZMK_BLE_SPLIT_PERIPHERAL_COUNT; i++) {
+            zmk_split_bt_invoke_behavior(i, &binding, event, pressed);
+        }
+#endif
+        return invoke_locally(&binding, event, pressed);
+    }
+
+    return -ENOTSUP;
 }
 
 int zmk_keymap_position_state_changed(uint8_t source, uint32_t position, bool pressed,
@@ -250,7 +290,7 @@ int zmk_keymap_sensor_triggered(uint8_t sensor_number, const struct sensor_value
 int keymap_listener(const zmk_event_t *eh) {
     const struct zmk_position_state_changed *pos_ev;
     if ((pos_ev = as_zmk_position_state_changed(eh)) != NULL) {
-        return zmk_keymap_position_state_changed(pos_ev->position, pos_ev->state,
+        return zmk_keymap_position_state_changed(pos_ev->source, pos_ev->position, pos_ev->state,
                                                  pos_ev->timestamp);
     }
 
