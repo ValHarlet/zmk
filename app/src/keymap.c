@@ -186,13 +186,14 @@ int zmk_keymap_apply_position_state(int layer, uint32_t position, bool pressed, 
     }
 }
 
-int zmk_keymap_position_state_changed(uint32_t position, bool pressed, int64_t timestamp) {
+int zmk_keymap_position_state_changed(uint8_t source, uint32_t position, bool pressed,
+                                      int64_t timestamp) {
     if (pressed) {
         zmk_keymap_active_behavior_layer[position] = _zmk_keymap_layer_state;
     }
     for (int layer = ZMK_KEYMAP_LAYERS_LEN - 1; layer >= _zmk_keymap_layer_default; layer--) {
         if (zmk_keymap_layer_active_with_state(layer, zmk_keymap_active_behavior_layer[position])) {
-            int ret = zmk_keymap_apply_position_state(layer, position, pressed, timestamp);
+            int ret = zmk_keymap_apply_position_state(source, layer, position, pressed, timestamp);
             if (ret > 0) {
                 LOG_DBG("behavior processing to continue to next layer");
                 continue;
