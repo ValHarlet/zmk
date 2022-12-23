@@ -1,6 +1,6 @@
 file_format: "1"
 id: SplitVH
-name: Lotus58
+name: SplitVH
 type: shield
 url: https://github.com/TweetyDaBird/Lotus58
 requires: [pro_micro]
