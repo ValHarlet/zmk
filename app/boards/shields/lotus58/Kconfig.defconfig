@@ -4,7 +4,7 @@
 if SHIELD_LOTUS58_LEFT
 
 config ZMK_KEYBOARD_NAME
-	default "Lotus58"
+	default "SplitVH"
 
 config ZMK_SPLIT_ROLE_CENTRAL
 	default y
