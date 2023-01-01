@@ -22,6 +22,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/position_state_changed.h>
+#include <zmk/events/battery_state_changed.h>
 #include <zmk/events/sensor_event.h>
 #include <init.h>
 
@@ -34,8 +35,14 @@ static struct bt_conn *default_conn;
 static struct bt_uuid_128 uuid = BT_UUID_INIT_128(ZMK_SPLIT_BT_SERVICE_UUID);
 static struct bt_gatt_discover_params discover_params;
 static struct bt_gatt_subscribe_params subscribe_params;
+struct bt_gatt_subscribe_params batt_lvl_subscribe_params;
+struct bt_gatt_read_params batt_lvl_read_params;
+struct bt_gatt_discover_params sub_discover_params;
 
 K_MSGQ_DEFINE(peripheral_event_msgq, sizeof(struct zmk_position_state_changed),
+              CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, 4);
+
+K_MSGQ_DEFINE(peripheral_batt_lvl_msgq, sizeof(struct zmk_peripheral_battery_state_changed),
               CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, 4);
 
 void peripheral_event_work_callback(struct k_work *work) {
@@ -51,6 +58,7 @@ K_WORK_DEFINE(peripheral_event_work, peripheral_event_work_callback);
 #if ZMK_KEYMAP_HAS_SENSORS
 K_MSGQ_DEFINE(peripheral_sensor_event_msgq, sizeof(struct zmk_sensor_event),
               CONFIG_ZMK_SPLIT_BLE_CENTRAL_POSITION_QUEUE_SIZE, 4);
+
 
 void peripheral_sensor_event_work_callback(struct k_work *work) {
     struct zmk_sensor_event ev;
@@ -129,8 +137,81 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
     return BT_GATT_ITER_CONTINUE;
 }
 
-static int split_central_subscribe(struct bt_conn *conn, struct bt_gatt_subscribe_params *params) {
-    int err = bt_gatt_subscribe(conn, params);
+
+void peripheral_batt_lvl_change_callback(struct k_work *work) {
+    struct zmk_peripheral_battery_state_changed ev;
+    while (k_msgq_get(&peripheral_batt_lvl_msgq, &ev, K_NO_WAIT) == 0) {
+        LOG_DBG("Triggering peripheral battery level change %u", ev.state_of_charge);
+        ZMK_EVENT_RAISE(new_zmk_peripheral_battery_state_changed(ev));
+    }
+}
+
+K_WORK_DEFINE(peripheral_batt_lvl_work, peripheral_batt_lvl_change_callback);
+
+static uint8_t split_central_battery_level_notify_func(struct bt_conn *conn,
+                                                       struct bt_gatt_subscribe_params *params,
+                                                       const void *data, uint16_t length) {
+    //struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
+
+    if (slot == NULL) {
+        LOG_ERR("No peripheral state found for connection");
+        return BT_GATT_ITER_CONTINUE;
+    }
+
+    if (!data) {
+        LOG_DBG("[UNSUBSCRIBED]");
+        //params->value_handle = 0U;
+        return BT_GATT_ITER_STOP;
+    }
+
+    LOG_DBG("[BATTERY LEVEL NOTIFICATION] data %p length %u", data, length);
+    uint8_t battery_level = ((uint8_t *)data)[0];
+    LOG_DBG("Battery level: %u", battery_level);
+    struct zmk_peripheral_battery_state_changed ev = {.state_of_charge = battery_level};
+    k_msgq_put(&peripheral_batt_lvl_msgq, &ev, K_NO_WAIT);
+    k_work_submit(&peripheral_batt_lvl_work);
+
+    return BT_GATT_ITER_CONTINUE;
+}
+static uint8_t split_central_battery_level_read_func(struct bt_conn *conn, uint8_t err,
+                                                     struct bt_gatt_read_params *params,
+                                                     const void *data, uint16_t length) {
+    if (err > 0) {
+        LOG_ERR("Error during reading peripheral battery level: %u", err);
+        return BT_GATT_ITER_STOP;
+    }
+
+K_WORK_DEFINE(peripheral_batt_lvl_work, peripheral_batt_lvl_change_callback);
+
+
+    //struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
+
+    if (slot == NULL) {
+        LOG_ERR("No peripheral state found for connection");
+        return BT_GATT_ITER_CONTINUE;
+    }
+
+    if (!data) {
+        LOG_DBG("[READ COMPLETED]");
+        return BT_GATT_ITER_STOP;
+    }
+
+    LOG_DBG("[BATTERY LEVEL READ] data %p length %u", data, length);
+
+    uint8_t battery_level = ((uint8_t *)data)[0];
+
+    LOG_DBG("Battery level: %u", battery_level);
+
+    struct zmk_peripheral_battery_state_changed ev = {.state_of_charge = battery_level};
+    k_msgq_put(&peripheral_batt_lvl_msgq, &ev, K_NO_WAIT);
+    k_work_submit(&peripheral_batt_lvl_work);
+
+    return BT_GATT_ITER_CONTINUE;
+}
+
+static void split_central_subscribe(struct bt_conn *conn,
+                                    struct bt_gatt_subscribe_params *subscribe_params) {
+    int err = bt_gatt_subscribe(conn, subscribe_params);
     switch (err) {
     case -EALREADY:
         LOG_DBG("[ALREADY SUBSCRIBED]");
@@ -197,7 +278,7 @@ static uint8_t split_central_discovery_func(struct bt_conn *conn, const struct b
     if (!bt_uuid_cmp(discover_params.uuid, BT_UUID_DECLARE_128(ZMK_SPLIT_BT_SERVICE_UUID))) {
         memcpy(&uuid, BT_UUID_DECLARE_128(ZMK_SPLIT_BT_CHAR_POSITION_STATE_UUID), sizeof(uuid));
         discover_params.uuid = &uuid.uuid;
-        discover_params.start_handle = attr->handle + 1;
+        //discover_params.start_handle = attr->handle + 1;
         discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
 
         err = bt_gatt_discover(conn, &discover_params);
@@ -231,7 +312,24 @@ static uint8_t split_central_discovery_func(struct bt_conn *conn, const struct b
             LOG_ERR("Discover failed (err %d)", err);
         }
 #endif /* ZMK_KEYMAP_HAS_SENSORS */
-    } else {
+    } else if (!bt_uuid_cmp(((struct bt_gatt_chrc *)attr->user_data)->uuid,
+                            BT_UUID_BAS_BATTERY_LEVEL)) {
+        LOG_DBG("Found battery level characteristics");
+        batt_lvl_subscribe_params.disc_params = &sub_discover_params;
+        batt_lvl_subscribe_params.end_handle = discover_params.end_handle;
+        batt_lvl_subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
+        batt_lvl_subscribe_params.notify = split_central_battery_level_notify_func;
+        batt_lvl_subscribe_params.value = BT_GATT_CCC_NOTIFY;
+        split_central_subscribe(conn, &batt_lvl_subscribe_params);
+
+        batt_lvl_read_params.func = split_central_battery_level_read_func;
+        batt_lvl_read_params.handle_count = 1;
+        batt_lvl_read_params.single.handle = bt_gatt_attr_value_handle(attr);
+        batt_lvl_read_params.single.offset = 0;
+        bt_gatt_read(conn, &batt_lvl_read_params);
+    }
+
+    else {
         subscribe_params.notify = split_central_notify_func;
         subscribe_params.value = BT_GATT_CCC_NOTIFY;
         subscribe_params.ccc_handle = attr->handle;
